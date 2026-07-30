@@ -60,6 +60,14 @@ func cliCompatibleMigrationSQL(name, sqlText string) string {
 		// schema delta: create the ephemeral leases table, drop the issues/
 		// wisps lease columns 0054 added. row_lock stays (see the migration).
 		return cliMigration0055MoveLeasesToTable
+	case "0060_add_storage_class.up.sql":
+		// Direct DDL for the same reason as 0054/0055: the Dolt CLI does not
+		// apply the prepared ALTER TABLE statements the runtime migration uses
+		// (guarded there for idempotent re-runs on upgraded databases), so a
+		// fresh bundle would otherwise omit storage_class while still recording
+		// 0060 as applied. Fresh databases always have both tables, so emit the
+		// columns directly on issues and wisps.
+		return cliMigration0060AddStorageClass
 	default:
 		return sqlText
 	}
@@ -100,6 +108,9 @@ ALTER TABLE issues DROP COLUMN lease_expires_at;
 ALTER TABLE issues DROP COLUMN heartbeat_at;
 ALTER TABLE wisps DROP COLUMN lease_expires_at;
 ALTER TABLE wisps DROP COLUMN heartbeat_at;`
+
+const cliMigration0060AddStorageClass = `ALTER TABLE issues ADD COLUMN storage_class VARCHAR(16);
+ALTER TABLE wisps ADD COLUMN storage_class VARCHAR(16);`
 
 const cliMigration0041SplitDependenciesTarget = `DELETE FROM dolt_nonlocal_tables;
 CALL DOLT_COMMIT('-Am', 'disable nonlocal tables for fk migrations');

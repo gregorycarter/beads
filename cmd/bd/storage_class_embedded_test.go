@@ -110,6 +110,26 @@ func TestEmbeddedCreateStorageClass(t *testing.T) {
 		}
 	})
 
+	// An explicit durable class combined with a wisp-plane flag is a direct
+	// command-line contradiction: the row would be ephemeral by construction, so
+	// honoring the request is impossible. It must be rejected up front, not
+	// silently collapsed into an effective-ephemeral record (Protocol v0.1 §C1.3).
+	t.Run("explicit_versioned_with_ephemeral_is_rejected", func(t *testing.T) {
+		dir, _, _ := bdInit(t, bd, "--prefix", "sf")
+		out := bdCreateFail(t, bd, dir, "Conflicting bead", "--ephemeral", "--storage-class", "versioned")
+		if !strings.Contains(out, "conflicts with --ephemeral/--no-history") {
+			t.Errorf("expected wisp-plane conflict error, got:\n%s", out)
+		}
+	})
+
+	t.Run("explicit_versioned_with_no_history_is_rejected", func(t *testing.T) {
+		dir, _, _ := bdInit(t, bd, "--prefix", "sg")
+		out := bdCreateFail(t, bd, dir, "Conflicting bead", "--no-history", "--storage-class", "versioned")
+		if !strings.Contains(out, "conflicts with --ephemeral/--no-history") {
+			t.Errorf("expected wisp-plane conflict error, got:\n%s", out)
+		}
+	})
+
 	t.Run("config_set_validates_value", func(t *testing.T) {
 		dir, _, _ := bdInit(t, bd, "--prefix", "sx")
 		out, err := bdRunWithFlockRetry(t, bd, dir, "config", "set", "storage-class.task", "permanent")

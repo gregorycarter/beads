@@ -15,11 +15,12 @@ func TestResolveStorageClassExplicit(t *testing.T) {
 		t.Errorf("explicit unversioned: got %q, %v", got, err)
 	}
 
-	// Explicit versioned normalizes to unset (C2.4 omitted-when-versioned)
-	// while still overriding any per-type config default upstream.
+	// Explicit versioned is returned verbatim; callers normalize it to the unset
+	// marker (C2.4 omitted-when-versioned) only after plane-conflict validation,
+	// so the durable request survives long enough to be honored or rejected.
 	got, err = resolveStorageClass("versioned", types.TypeTask)
-	if err != nil || got != "" {
-		t.Errorf("explicit versioned should normalize to unset: got %q, %v", got, err)
+	if err != nil || got != types.StorageClassVersioned {
+		t.Errorf("explicit versioned should be preserved: got %q, %v", got, err)
 	}
 
 	got, err = resolveStorageClass("ephemeral", types.TypeTask)

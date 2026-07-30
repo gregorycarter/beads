@@ -212,6 +212,19 @@ var createCmd = &cobra.Command{
 			wisp = true
 			storageClass = "" // wisp-plane rows derive ephemeral class (C1.2); no marker cell needed
 		}
+		// An explicitly requested durable class (versioned/unversioned) cannot be
+		// honored on a wisp-plane row: the row is ephemeral by construction, so the
+		// request would be silently dropped. Reject it here, before normalizing
+		// versioned away, so the durable intent is preserved rather than collapsed
+		// into an effective-ephemeral record (Protocol v0.1 §C1.3). This gates on
+		// the explicit --storage-class flag only: a per-type config default still
+		// yields to an explicit --ephemeral/--no-history flag (flag > config).
+		if storageClassFlag != "" && storageClass != "" && (wisp || noHistory) {
+			return HandleError("--storage-class %s conflicts with --ephemeral/--no-history: wisp-plane records are storage class ephemeral", storageClass)
+		}
+		// Normalize versioned to the unset marker only after the conflict check
+		// (C2.4): the durable request has been honored or rejected above.
+		storageClass = storageClass.Normalize()
 		molTypeStr, _ := cmd.Flags().GetString("mol-type")
 		var molType types.MolType
 		if molTypeStr != "" {
@@ -648,13 +661,16 @@ type createIssueParams struct {
 	Metadata           json.RawMessage
 }
 
-// resolveStorageClass resolves the effective storage class at create time
+// resolveStorageClass resolves the requested storage class at create time
 // (Protocol v0.1 C1.3): the explicit --storage-class flag wins; otherwise the
 // per-type config default storage-class.<type> applies; otherwise unset.
-// Versioned normalizes to unset — the class marker is omitted when versioned
-// (C2.4), and both spell identical semantics (C1.2). Values are validated
-// wherever they came from: a bad flag is a usage error, a bad config value is
-// a config bug and fails just as loudly.
+// The parsed class is returned verbatim, including versioned. The caller must
+// normalize versioned to the unset marker (the marker is omitted when
+// versioned, C2.4) only AFTER plane-conflict validation, so an explicit durable
+// request paired with a wisp-plane flag is rejected rather than silently erased
+// into an effective-ephemeral row. Values are validated wherever they came
+// from: a bad flag is a usage error, a bad config value is a config bug and
+// fails just as loudly.
 func resolveStorageClass(explicit string, issueType types.IssueType) (types.StorageClass, error) {
 	raw := explicit
 	if raw == "" {
@@ -669,9 +685,6 @@ func resolveStorageClass(explicit string, issueType types.IssueType) (types.Stor
 			return "", fmt.Errorf("config storage-class.%s: %w", issueType, err)
 		}
 		return "", err
-	}
-	if class == types.StorageClassVersioned {
-		return "", nil
 	}
 	return class, nil
 }
