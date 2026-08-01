@@ -212,19 +212,18 @@ var createCmd = &cobra.Command{
 			wisp = true
 			storageClass = "" // wisp-plane rows derive ephemeral class (C1.2); no marker cell needed
 		}
-		// An explicitly requested durable class (versioned/unversioned) cannot be
-		// honored on a wisp-plane row: the row is ephemeral by construction, so the
-		// request would be silently dropped. Reject it here, before normalizing
-		// versioned away, so the durable intent is preserved rather than collapsed
-		// into an effective-ephemeral record (Protocol v0.1 §C1.3). This gates on
-		// the explicit --storage-class flag only: a per-type config default still
-		// yields to an explicit --ephemeral/--no-history flag (flag > config).
-		if storageClassFlag != "" && storageClass != "" && (wisp || noHistory) {
+		// Reconcile the requested durable class with the effective wisp plane
+		// (flag > config, Protocol v0.1 §C1.3): an explicit --storage-class
+		// contradicts --ephemeral/--no-history and is rejected, so the durable
+		// intent is preserved rather than silently collapsed into an
+		// effective-ephemeral record; a per-type config default yields to the
+		// explicit flag. versioned normalizes to the unset marker only after the
+		// check (C2.4).
+		var storageClassConflict bool
+		storageClass, storageClassConflict = reconcileStorageClassPlane(storageClass, storageClassFlag != "", wisp || noHistory)
+		if storageClassConflict {
 			return HandleError("--storage-class %s conflicts with --ephemeral/--no-history: wisp-plane records are storage class ephemeral", storageClass)
 		}
-		// Normalize versioned to the unset marker only after the conflict check
-		// (C2.4): the durable request has been honored or rejected above.
-		storageClass = storageClass.Normalize()
 		molTypeStr, _ := cmd.Flags().GetString("mol-type")
 		var molType types.MolType
 		if molTypeStr != "" {
@@ -687,6 +686,30 @@ func resolveStorageClass(explicit string, issueType types.IssueType) (types.Stor
 		return "", err
 	}
 	return class, nil
+}
+
+// reconcileStorageClassPlane applies flag-over-config precedence between a
+// resolved storage class and the effective wisp plane (Protocol v0.1 §C1.3).
+// A wisp-plane record is ephemeral by construction, so a durable class
+// (versioned/unversioned) cannot ride on it. explicit reports whether the class
+// came from an explicit flag/field rather than a per-type config default:
+//   - explicit durable class + wisp plane -> conflict=true; the caller rejects
+//     it so the durable intent is preserved rather than silently collapsed into
+//     an effective-ephemeral record;
+//   - config-derived durable class + wisp plane -> cleared, yielding to the
+//     explicit --ephemeral/--no-history plane.
+//
+// versioned normalizes to the unset marker (C2.4) only after the check, so the
+// durable request survives long enough to be honored, rejected, or yielded. On
+// conflict the class is returned verbatim so the caller can name it in the error.
+func reconcileStorageClassPlane(class types.StorageClass, explicit, wispPlane bool) (types.StorageClass, bool) {
+	if class != "" && wispPlane {
+		if explicit {
+			return class, true
+		}
+		class = "" // config default yields to the explicit wisp-plane flag
+	}
+	return class.Normalize(), false
 }
 
 func buildCreateIssue(params createIssueParams) *types.Issue {

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -884,6 +885,71 @@ func TestGraphApplyNodeStorageClassConflicts(t *testing.T) {
 			}
 			if class != tt.wantClass {
 				t.Errorf("class = %q, want %q", class, tt.wantClass)
+			}
+		})
+	}
+}
+
+// A per-type config default (storage-class.<type>=unversioned) must yield to an
+// effective wisp plane rather than reaching validation and blocking the node
+// (flag > config, Protocol v0.1 §C1.3). Unlike the hermetic conflict cases
+// above, these leave node.StorageClass unset so resolution reads the config
+// global, so the subtests share one process-wide config and cannot run in
+// parallel. The precondition assert guards against a silent pass if config
+// never initialized (Set is a no-op on an uninitialized viper).
+func TestGraphApplyNodeStorageClassConfigDefaultYieldsToWispPlane(t *testing.T) {
+	config.ResetForTesting()
+	t.Cleanup(config.ResetForTesting)
+	if err := config.Initialize(); err != nil {
+		t.Fatalf("config.Initialize: %v", err)
+	}
+	config.Set("storage-class.task", "unversioned")
+	if got := config.GetString("storage-class.task"); got != "unversioned" {
+		t.Fatalf("precondition: storage-class.task = %q, want unversioned", got)
+	}
+
+	boolPtr := func(b bool) *bool { return &b }
+
+	tests := []struct {
+		name      string
+		node      GraphApplyNode
+		opts      GraphApplyOptions
+		wantEphem bool
+		wantNoHis bool
+	}{
+		{
+			name:      "plan-wide ephemeral clears config-derived unversioned",
+			node:      GraphApplyNode{Key: "n1", Type: "task"},
+			opts:      GraphApplyOptions{Ephemeral: true},
+			wantEphem: true,
+		},
+		{
+			name:      "node-level ephemeral clears config-derived unversioned",
+			node:      GraphApplyNode{Key: "n2", Type: "task", Ephemeral: boolPtr(true)},
+			wantEphem: true,
+		},
+		{
+			name:      "plan-wide no_history clears config-derived unversioned",
+			node:      GraphApplyNode{Key: "n3", Type: "task"},
+			opts:      GraphApplyOptions{NoHistory: true},
+			wantNoHis: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ephemeral, noHistory, class, err := graphApplyNodeStorageClass(tt.node, tt.opts)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if class != "" {
+				t.Errorf("class = %q, want empty (config default yields to wisp plane)", class)
+			}
+			if ephemeral != tt.wantEphem {
+				t.Errorf("ephemeral = %v, want %v", ephemeral, tt.wantEphem)
+			}
+			if noHistory != tt.wantNoHis {
+				t.Errorf("noHistory = %v, want %v", noHistory, tt.wantNoHis)
 			}
 		})
 	}

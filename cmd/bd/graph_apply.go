@@ -876,10 +876,12 @@ func graphApplyNodeIssue(node GraphApplyNode, opts GraphApplyOptions, createdBy,
 // node's explicit storage_class wins, then storage-class.<type> config, else
 // unset. "ephemeral" is the spelled-out spelling of ephemeral: true (C1.4) —
 // it routes the node to the wisp plane and leaves the marker cell empty
-// (wisp-plane rows derive their class, C1.2). An explicit durable class
+// (wisp-plane rows derive their class, C1.2). A durable class
 // (versioned/unversioned) combined with an effective wisp-plane node is
-// rejected rather than silently erased; versioned is normalized to the unset
-// marker only after that check.
+// reconciled by flag-over-config precedence: an explicit node storage_class is
+// rejected rather than silently erased, while a per-type config default yields
+// to the effective plane; versioned normalizes to the unset marker only after
+// that check.
 func graphApplyNodeStorageClass(node GraphApplyNode, opts GraphApplyOptions) (ephemeral, noHistory bool, class types.StorageClass, err error) {
 	ephemeral = opts.Ephemeral
 	if node.Ephemeral != nil {
@@ -910,19 +912,18 @@ func graphApplyNodeStorageClass(node GraphApplyNode, opts GraphApplyOptions) (ep
 		ephemeral = true
 		class = ""
 	}
-	// An explicitly requested durable class (versioned/unversioned) cannot be
-	// honored on a wisp-plane node: the row is ephemeral by construction, so the
-	// request would be silently dropped. Reject it here, before normalizing
-	// versioned away, so the durable intent is preserved rather than collapsed
-	// into an effective-ephemeral record (Protocol v0.1 §C1.3). This gates on the
-	// node's explicit storage_class only; a per-type config default still yields
-	// to an effective ephemeral/no_history plane.
-	if node.StorageClass != "" && class != "" && (ephemeral || noHistory) {
+	// Reconcile the requested durable class with the effective wisp plane
+	// (flag > config, Protocol v0.1 §C1.3): an explicit node storage_class
+	// contradicts an ephemeral/no_history node and is rejected, so the durable
+	// intent is preserved rather than silently collapsed into an
+	// effective-ephemeral record; a per-type config default yields to the
+	// effective plane. versioned normalizes to the unset marker only after the
+	// check (C2.4).
+	var conflict bool
+	class, conflict = reconcileStorageClassPlane(class, node.StorageClass != "", ephemeral || noHistory)
+	if conflict {
 		return false, false, "", fmt.Errorf("node %q: storage_class %s conflicts with ephemeral/no_history: wisp-plane records are storage class ephemeral", node.Key, class)
 	}
-	// Normalize versioned to the unset marker only after the conflict check
-	// (C2.4): the durable request has been honored or rejected above.
-	class = class.Normalize()
 	return ephemeral, noHistory, class, nil
 }
 
