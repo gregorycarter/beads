@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -127,80 +128,11 @@ func scanStringsInto(rows *sql.Rows, out *[]string) error {
 	return rows.Err()
 }
 
-//nolint:gosec // G201: depTable is hardcoded.
+// getDescendantIDs delegates to the shared issueops breadth-first walk; the
+// runner satisfies issueops.DBTX the same way it does for the blocked-state
+// recompute (bd-6dnrw.44 item 3). Both stacks used to carry hand-copied
+// recursive CTEs whose string-path dedup went combinatorial on diamond-dense
+// graphs (be-dlw); one body of code means the fix cannot drift apart again.
 func (r *issueSQLRepositoryImpl) getDescendantIDs(ctx context.Context, rootID string, maxDepth int) ([]string, error) {
-	if rootID == "" {
-		return nil, nil
-	}
-
-	queryDescendants := func(includeWisps bool) ([]string, bool, error) {
-		edgeQuery := fmt.Sprintf(`
-			SELECT issue_id, %s FROM dependencies WHERE type = 'parent-child'
-		`, depTargetExpr)
-		if includeWisps {
-			edgeQuery += fmt.Sprintf(`
-			UNION ALL
-			SELECT issue_id, %s FROM wisp_dependencies WHERE type = 'parent-child'
-		`, depTargetExpr)
-		}
-
-		//nolint:gosec // G201: edgeQuery is built from hardcoded SQL plus depTargetExpr (no user input)
-		query := fmt.Sprintf(`
-			WITH RECURSIVE
-			parent_edges(issue_id, depends_on_id) AS (
-				%s
-			),
-			descendants(id, depth, path) AS (
-				SELECT issue_id, 1, CONCAT(',', ?, ',', issue_id, ',')
-				FROM parent_edges
-				WHERE depends_on_id = ?
-				UNION ALL
-				SELECT e.issue_id, d.depth + 1, CONCAT(d.path, e.issue_id, ',')
-				FROM parent_edges e
-				JOIN descendants d ON e.depends_on_id = d.id
-				WHERE (? <= 0 OR d.depth < ?)
-				  AND LOCATE(CONCAT(',', e.issue_id, ','), d.path) = 0
-			)
-			SELECT id, depth FROM descendants WHERE id <> ?
-		`, edgeQuery)
-
-		rows, err := r.runner.QueryContext(ctx, query, rootID, rootID, maxDepth, maxDepth, rootID)
-		if err != nil {
-			return nil, false, err
-		}
-		defer func() { _ = rows.Close() }()
-
-		var result []string
-		reachedMaxDepth := false
-		for rows.Next() {
-			var id string
-			var depth int
-			if err := rows.Scan(&id, &depth); err != nil {
-				return nil, false, fmt.Errorf("scan descendant: %w", err)
-			}
-			result = append(result, id)
-			if maxDepth > 0 && depth >= maxDepth {
-				reachedMaxDepth = true
-			}
-		}
-		if err := rows.Err(); err != nil {
-			return nil, false, fmt.Errorf("descendant rows: %w", err)
-		}
-		return result, reachedMaxDepth, nil
-	}
-
-	result, reachedMaxDepth, err := queryDescendants(true)
-	if err != nil {
-		if !dberrors.IsTableNotExist(err) {
-			return nil, err
-		}
-		result, reachedMaxDepth, err = queryDescendants(false)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if reachedMaxDepth {
-		return nil, fmt.Errorf("parent descendant traversal for %s reached max depth %d", rootID, maxDepth)
-	}
-	return result, nil
+	return issueops.GetDescendantIDsInTx(ctx, r.runner, rootID, maxDepth)
 }

@@ -159,81 +159,98 @@ func GetChildrenOfIssuesInTx(ctx context.Context, tx DBTX, parentIDs []string) (
 	return children, nil
 }
 
+// GetDescendantIDsInTx returns the IDs of every transitive parent-child
+// descendant of rootID, walking the edges breadth-first in Go with a visited
+// set.
+//
+// It replaces a recursive CTE that deduplicated by matching each discovered
+// path as a delimiter-joined id string (LOCATE over a CONCAT accumulator).
+// That guard is per-path, so a node reachable through k distinct routes was
+// expanded k times and the walk went combinatorial on diamond-dense graphs —
+// single invocations ran 14s+ on a few-hundred-edge graph, and one such query
+// starves every other connection on a shared single-writer Dolt server
+// (be-dlw). The BFS admits each node to the frontier once: O(V+E) total work,
+// one IN-batched query per level per dependency table.
+//
+// maxDepth <= 0 is unbounded; termination on cyclic data (imports can land
+// parent-child cycles the add-time gate would refuse) comes from the visited
+// set, not a depth bound. With maxDepth > 0 the walk fails once any node's
+// shortest path from rootID reaches maxDepth levels — the same "reached max
+// depth" contract the CTE had, minus its false positives: the CTE measured
+// per-path depth, so a node also reachable through a redundant longer route
+// could trip the bound spuriously.
 func GetDescendantIDsInTx(ctx context.Context, tx DBTX, rootID string, maxDepth int) ([]string, error) {
 	if rootID == "" {
 		return nil, nil
 	}
 
-	queryDescendants := func(includeWisps bool) ([]string, bool, error) {
-		edgeQuery := fmt.Sprintf(`
-			SELECT issue_id, %s FROM dependencies WHERE type = 'parent-child'
-		`, DepTargetExpr)
-		if includeWisps {
-			edgeQuery += fmt.Sprintf(`
-			UNION ALL
-			SELECT issue_id, %s FROM wisp_dependencies WHERE type = 'parent-child'
-		`, DepTargetExpr)
-		}
-
-		//nolint:gosec // G201: edgeQuery is built from hardcoded SQL plus DepTargetExpr (no user input)
-		query := fmt.Sprintf(`
-			WITH RECURSIVE
-			parent_edges(issue_id, depends_on_id) AS (
-				%s
-			),
-			descendants(id, depth, path) AS (
-				SELECT issue_id, 1, CONCAT(',', ?, ',', issue_id, ',')
-				FROM parent_edges
-				WHERE depends_on_id = ?
-				UNION ALL
-				SELECT e.issue_id, d.depth + 1, CONCAT(d.path, e.issue_id, ',')
-				FROM parent_edges e
-				JOIN descendants d ON e.depends_on_id = d.id
-				WHERE (? <= 0 OR d.depth < ?)
-				  AND LOCATE(CONCAT(',', e.issue_id, ','), d.path) = 0
-			)
-			SELECT id, depth FROM descendants WHERE id <> ?
-		`, edgeQuery)
-
-		rows, err := tx.QueryContext(ctx, query, rootID, rootID, maxDepth, maxDepth, rootID)
-		if err != nil {
-			return nil, false, err
-		}
-		defer func() { _ = rows.Close() }()
-
-		var result []string
-		reachedMaxDepth := false
-		for rows.Next() {
-			var id string
-			var depth int
-			if err := rows.Scan(&id, &depth); err != nil {
-				return nil, false, fmt.Errorf("scan descendant: %w", err)
+	includeWisps := true
+	visited := map[string]struct{}{rootID: {}}
+	frontier := []string{rootID}
+	var result []string
+	for depth := 1; len(frontier) > 0; depth++ {
+		var level []string
+		for _, depTable := range []string{"dependencies", "wisp_dependencies"} {
+			if depTable == "wisp_dependencies" && !includeWisps {
+				continue
 			}
+			children, err := parentChildSourcesInTx(ctx, tx, depTable, frontier)
+			if err != nil {
+				if optionalBlockedTable(depTable) && isTableNotExistError(err) {
+					includeWisps = false
+					continue
+				}
+				return nil, err
+			}
+			level = append(level, children...)
+		}
+		frontier = frontier[:0]
+		for _, id := range level {
+			if _, seen := visited[id]; seen {
+				continue
+			}
+			visited[id] = struct{}{}
 			result = append(result, id)
-			if maxDepth > 0 && depth >= maxDepth {
-				reachedMaxDepth = true
-			}
+			frontier = append(frontier, id)
 		}
-		if err := rows.Err(); err != nil {
-			return nil, false, fmt.Errorf("descendant rows: %w", err)
+		if maxDepth > 0 && depth >= maxDepth && len(frontier) > 0 {
+			return nil, fmt.Errorf("parent descendant traversal for %s reached max depth %d", rootID, maxDepth)
 		}
-		return result, reachedMaxDepth, nil
-	}
-
-	result, reachedMaxDepth, err := queryDescendants(true)
-	if err != nil {
-		if !isTableNotExistError(err) {
-			return nil, err
-		}
-		result, reachedMaxDepth, err = queryDescendants(false)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if reachedMaxDepth {
-		return nil, fmt.Errorf("parent descendant traversal for %s reached max depth %d", rootID, maxDepth)
 	}
 	return result, nil
+}
+
+// parentChildSourcesInTx returns the issue_id of every parent-child row in
+// depTable whose target is one of parentIDs, batching the IN clause so a wide
+// BFS level cannot build an unbounded statement.
+func parentChildSourcesInTx(ctx context.Context, tx DBTX, depTable string, parentIDs []string) ([]string, error) {
+	var out []string
+	for start := 0; start < len(parentIDs); start += queryBatchSize {
+		batch := parentIDs[start:min(start+queryBatchSize, len(parentIDs))]
+		inClause, args := buildSQLInClause(batch)
+		//nolint:gosec // G201: depTable is a hardcoded constant, inClause is placeholders.
+		query := fmt.Sprintf(`
+			SELECT issue_id FROM %s
+			WHERE type = 'parent-child' AND %s IN (%s)
+		`, depTable, DepTargetExpr, inClause)
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan descendant: %w", err)
+			}
+			out = append(out, id)
+		}
+		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("descendant rows: %w", err)
+		}
+	}
+	return out, nil
 }
 
 //nolint:gosec // G201: tables are hardcoded

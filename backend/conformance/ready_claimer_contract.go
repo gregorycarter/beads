@@ -652,10 +652,11 @@ func RunReadyClaimerDoesNotMutateTheCallerRequest(t *testing.T, ctx context.Cont
 //     would have matched.
 //   - the parent restricts, through BOTH of its arms. The parent clause is a
 //     disjunction — a dotted-id descendant that owns no parent-child edge, OR a
-//     row the recursive descendant walk reached — and the two are separate
-//     bodies of code (issueops.GetDescendantIDsInTx and the unit of work's
-//     hand-copied getDescendantIDs). One row of each shape is seeded, and the
-//     second claim is what proves the walk arm is live.
+//     row the descendant walk reached — and the two are separate clauses fed
+//     by separate code (the dotted LIKE fallback and the shared
+//     issueops.GetDescendantIDsInTx breadth-first walk both stacks now
+//     delegate to). One row of each shape is seeded, and the second claim is
+//     what proves the walk arm is live.
 //   - an EXHAUSTED fence claims nothing. This is the safety property: the
 //     failure mode worth preventing is not an empty answer, it is a FULL one
 //     from outside the lane. The final unfenced claim takes the decoy, so the
