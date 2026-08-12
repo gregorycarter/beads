@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`sort` on `GET /v0/beads/issues`.** The listing served one order —
+  `(created_at DESC, id ASC)` — because the cursor is a keyset position in it,
+  and the spec said so in its own words: "the sort order is welded to the cursor
+  contract, and a new order needs new surface." The cost of that welding fell on
+  every client that wanted `bd list`'s ordering, because the only way to get it
+  was to page the whole result set and re-sort locally. Measured over a
+  1400-row store at the 200-row page an HTTP client actually uses, that is
+  **7 requests plus a client-side comparator; `?sort=priority` is 1**
+  (`TestProxiedServerListSortRetiresTheWalk`, which runs both strategies against
+  a real `bd serve` and checks both against `bd list --json` row for row). It is
+  the one cost on this surface that got worse as a project grew.
+
+  **Two values, and the set is closed.** `created` is the existing order, now
+  spellable. `priority` is `(priority ASC, created_at DESC, id ASC)` — `bd
+  list`'s flagless ordering, which is also what `bd list --sort priority`
+  produces, so one served order retires the walk for both. The other seven
+  orders `bd list --sort` takes are not offered: each value here is a cursor
+  contract needing a key proven total, and `id` is a natural-numeric order no
+  database expresses, `updated` moves on every write, `closed` is nullable, and
+  `status`/`title`/`type`/`assignee` are mutable and unindexed.
+
+  **Absent `sort` still means `created`, permanently.** It is the compatibility
+  contract for every client written before the parameter existed; changing it
+  would alter which rows a truncated page contains, with no error to notice it
+  by. A server that predates the parameter answers `param: "sort"` with
+  `reason: "unknown_parameter"`, which is the per-parameter capability probe a
+  client dispatches on to fall back.
+
+  **The cursor now carries its order, and a mismatch is refused.** This is the
+  half that makes the parameter safe rather than merely useful. The token was
+  base64 of `{t,i}` with no binding, so a `created`-order cursor replayed under
+  `sort=priority` would have decoded perfectly and been read as a position in a
+  different total order — a page that both skips and duplicates rows, served
+  with a 200, undetectable by the client. Tokens are now `v2` with an explicit
+  order member and decode refuses any token whose order differs from the
+  request's, as `invalid_cursor` (documented recovery: restart paging).
+  Outstanding `v1` tokens stay readable as the `created`-order positions they
+  are, so **no traversal in flight has to restart**. This does not contradict
+  "the token carries no filters": filters select the set, the order decides what
+  the position means.
+
+  **`priority` is a mutable key**, which `created_at` is not, and the spec says
+  so: under `created` only new rows move relative to a walk, while a priority
+  update moves an existing row too, so it can be seen twice or missed. That is
+  the already-documented "a cursor pins a position, not a snapshot" caveat
+  reached by a second route, not a new class of error — unchanged data never
+  skips or repeats under either order.
+
 ## [1.2.1] - 2026-08-11
 
 (Released as 1.2.1: the v1.2.0 tag burned pre-publish on a freebsd
