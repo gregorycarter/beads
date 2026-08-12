@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+
+	"golang.org/x/mod/semver"
 
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
@@ -42,8 +45,8 @@ func guardLegacyUpgradeWorkspace(beadsDir string) error {
 	if embeddeddolt.HasRepository(beadsDir) && !serverMode {
 		return nil
 	}
-	version, ok := legacyUpgradeVersionWitness(beadsDir)
-	if serverMode && ok && legacyServerVersion(version) {
+	version, present := legacyUpgradeVersionWitness(beadsDir)
+	if serverMode && present && legacyServerVersion(version) {
 		return legacyUpgradeRefusal(fmt.Sprintf("legacy Dolt server workspace from bd %s", version))
 	}
 	hasLocalDoltRoot := hasLegacyDoltRoot(beadsDir)
@@ -54,15 +57,25 @@ func guardLegacyUpgradeWorkspace(beadsDir string) error {
 		if currentVersionWitness(version) {
 			return nil
 		}
+		// A witness that is on disk but does not parse answers "this bd could
+		// not read a version file", not "this workspace predates the 1.0 era".
+		// Refusing on it turns every unrecognized version format into a total
+		// outage: bd rejects the workspace outright, including the diagnostics
+		// that would explain why. Warn and proceed instead; the confirmed
+		// verdicts above and below stay fail-closed.
+		if present && unreadableVersionWitness(version) {
+			warnUnreadableVersionWitness(beadsDir, version)
+			return nil
+		}
 		return legacyUpgradeRefusal("legacy Dolt server workspace")
 	}
 	if cfg == nil || cfg.DoltMode == "" ||
 		strings.EqualFold(cfg.DoltMode, configfile.DoltModeEmbedded) {
-		if doltserver.IsSharedServerMode() && !(ok && legacyServerVersion(version)) {
+		if doltserver.IsSharedServerMode() && !(present && legacyServerVersion(version)) {
 			return nil
 		}
 		reason := "legacy Dolt workspace"
-		if _, validVersion := legacyVersionMinor(version); ok && validVersion {
+		if _, validVersion := legacyVersionMinor(version); present && validVersion {
 			reason = fmt.Sprintf("legacy Dolt workspace from bd %s", version)
 		}
 		return legacyUpgradeRefusal(reason)
@@ -232,15 +245,34 @@ func isRegularFile(path string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
+// maxVersionWitnessBytes bounds the witness read. It is far above any version
+// string bd can stamp -- a Go pseudo-version carrying both a prerelease and
+// build metadata runs to roughly 70 bytes -- while keeping the read bounded.
+// The previous 64-byte bound was itself tight enough to reject a legitimate
+// version, which the guard would then have read as no witness at all.
+const maxVersionWitnessBytes = 256
+
+// legacyUpgradeVersionWitness reads the recorded version marker. The second
+// result reports whether the workspace carries a witness at all, which is a
+// separate question from whether its contents parse: no witness means no bd new
+// enough to track versions (0.29.0 and later) ever wrote here, while a witness
+// this bd cannot read means only that it does not recognize the format. A
+// blank witness carries no claim either way and counts as no witness.
+//
+// The version is empty when the marker exists but could not be read within its
+// size bound; that is an unreadable witness, not an absent one.
 func legacyUpgradeVersionWitness(beadsDir string) (string, bool) {
 	path := filepath.Join(beadsDir, localVersionFile)
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 64 {
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 {
 		return "", false
+	}
+	if info.Size() > maxVersionWitnessBytes {
+		return "", true
 	}
 	data, err := os.ReadFile(path) // #nosec G304 -- bounded file beneath selected workspace
 	if err != nil || int64(len(data)) != info.Size() {
-		return "", false
+		return "", true
 	}
 	version := strings.TrimSpace(string(data))
 	return version, version != ""
@@ -251,39 +283,97 @@ func legacyServerVersion(version string) bool {
 	return ok && minor >= 55 && minor <= 62
 }
 
-// currentVersionWitness identifies a syntactically valid post-1.0 version
-// marker. A local Dolt root in server mode is ambiguous without it, so that
-// shape must be refused rather than opened as a historical schema.
+// currentVersionWitness identifies a post-1.0 version marker. A local Dolt root
+// in server mode is ambiguous without one, so that shape must be refused rather
+// than opened as a historical schema.
 func currentVersionWitness(version string) bool {
-	parts := strings.Split(strings.TrimPrefix(version, "v"), ".")
-	if len(parts) != 3 {
-		return false
-	}
-	values := make([]int, len(parts))
-	for i, part := range parts {
-		value, err := strconv.Atoi(part)
-		if err != nil || value < 0 {
-			return false
-		}
-		values[i] = value
-	}
-	return values[0] >= 1
+	major, _, ok := versionWitnessMajorMinor(version)
+	return ok && major >= 1
+}
+
+// unreadableVersionWitness reports whether a witness carries something this bd
+// cannot read as a version at all. It is deliberately the complement of a real
+// semver parse rather than a blocklist: any format bd, its release pipeline, or
+// a downstream packager invents later lands here as unknown instead of being
+// misreported as a pre-1.0 workspace.
+func unreadableVersionWitness(version string) bool {
+	_, _, ok := versionWitnessMajorMinor(version)
+	return !ok
 }
 
 func legacyVersionMinor(version string) (int, bool) {
-	parts := strings.Split(strings.TrimPrefix(version, "v"), ".")
-	if len(parts) != 3 || parts[0] != "0" {
-		return 0, false
-	}
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return 0, false
-	}
-	if _, err := strconv.Atoi(parts[2]); err != nil {
+	major, minor, ok := versionWitnessMajorMinor(version)
+	if !ok || major != 0 {
 		return 0, false
 	}
 	return minor, true
 }
+
+// versionWitnessMajorMinor parses the recorded marker as semver and returns its
+// major and minor components.
+//
+// The witness holds whatever bd stamped into main.Version, and that is a full
+// semver string, not three integers: .goreleaser.yml and release.yml both stamp
+// the release tag verbatim (the repository already carries v1.1.0-rc.1 and
+// v1.1.0-rc.2), and module-pinned builds stamp a Go pseudo-version such as
+// v1.1.1-0.20260805093327-bf97b73749ac. Splitting on "." and demanding exactly
+// three parts rejected every one of those, so bd could not read back what bd
+// had written. Parsing with the same library the module system uses keeps the
+// reader's accepted set equal to the writer's emitted set.
+func versionWitnessMajorMinor(version string) (int, int, bool) {
+	canonical := "v" + strings.TrimPrefix(strings.TrimSpace(version), "v")
+	if !semver.IsValid(canonical) {
+		return 0, 0, false
+	}
+	// MajorMinor yields "vX.Y", or "vX" when the witness omitted the minor.
+	majorMinor := strings.TrimPrefix(semver.MajorMinor(canonical), "v")
+	majorText, minorText, hasMinor := strings.Cut(majorMinor, ".")
+	major, err := strconv.Atoi(majorText)
+	if err != nil {
+		return 0, 0, false
+	}
+	if !hasMinor {
+		return major, 0, true
+	}
+	minor, err := strconv.Atoi(minorText)
+	if err != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
+}
+
+// warnUnreadableVersionWitness reports an unrecognized marker once per
+// workspace. Proceeding on an unreadable witness is a judgement call, so it has
+// to be visible; the guard also runs against every ancestor directory during
+// undiscovered-workspace probing, so the same workspace must not warn twice.
+func warnUnreadableVersionWitness(beadsDir, version string) {
+	unreadableWitnessMu.Lock()
+	warned := unreadableWitnessWarned[beadsDir]
+	if !warned {
+		if unreadableWitnessWarned == nil {
+			unreadableWitnessWarned = map[string]bool{}
+		}
+		unreadableWitnessWarned[beadsDir] = true
+	}
+	unreadableWitnessMu.Unlock()
+	if warned {
+		return
+	}
+
+	detail := fmt.Sprintf("holds %q, which is not a recognized version", version)
+	if version == "" {
+		detail = "could not be read within its size bound"
+	}
+	fmt.Fprintf(os.Stderr,
+		"warning: %s in %s %s; treating the workspace as current. "+
+			"Run 'bd doctor' if this is unexpected.\n",
+		localVersionFile, beadsDir, detail)
+}
+
+var (
+	unreadableWitnessMu     sync.Mutex
+	unreadableWitnessWarned map[string]bool
+)
 
 func legacyUpgradeRefusal(reason string) error {
 	return legacyUpgradeRefusalError{reason: reason}

@@ -203,7 +203,13 @@ func TestLegacyUpgradeGuardMetadataLessSQLiteAndCurrentEmbeddedPrecedence(t *tes
 		}
 	})
 
-	t.Run("explicit server metadata with malformed version witness and local Dolt root is refused", func(t *testing.T) {
+	// A witness this bd cannot parse is an unanswerable question, not a
+	// confirmed cross-era workspace, so it warns and proceeds. This case used
+	// to be refused; that policy turned an unrecognized version format into a
+	// total refusal of every command against the workspace. The confirmed
+	// verdicts -- a witness that parses as pre-1.0, and a workspace with no
+	// witness at all -- stay refused above and below.
+	t.Run("explicit server metadata with malformed version witness and local Dolt root is admitted as unknown", func(t *testing.T) {
 		beadsDir := t.TempDir()
 		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"dolt","dolt_mode":"server"}`), 0o600); err != nil {
 			t.Fatal(err)
@@ -214,8 +220,8 @@ func TestLegacyUpgradeGuardMetadataLessSQLiteAndCurrentEmbeddedPrecedence(t *tes
 		if err := os.Mkdir(filepath.Join(beadsDir, "dolt"), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := guardLegacyUpgradeWorkspace(beadsDir); !isLegacyUpgradeRefusal(err) {
-			t.Fatalf("guardLegacyUpgradeWorkspace() = %v, want migration refusal", err)
+		if err := guardLegacyUpgradeWorkspace(beadsDir); err != nil {
+			t.Fatalf("guardLegacyUpgradeWorkspace() = %v, want nil for an unreadable witness", err)
 		}
 	})
 
@@ -250,8 +256,14 @@ func TestLegacyUpgradeGuardServerSelectionBeatsStaleEmbeddedRepository(t *testin
 	}{
 		{name: "historical witness", version: "0.62.0", wantRefusal: true},
 		{name: "missing witness", wantRefusal: true},
-		{name: "malformed witness", version: "not-a-version", wantRefusal: true},
+		// Unreadable is unknown, not legacy: the guard warns and proceeds
+		// rather than answering an unanswerable question with a refusal.
+		{name: "malformed witness", version: "not-a-version"},
 		{name: "current witness", version: "1.1.2"},
+		// The shapes bd's own release pipeline and module-pinned builds stamp.
+		{name: "prerelease witness", version: "1.1.0-rc.1"},
+		{name: "pseudo-version witness", version: "v1.1.1-0.20260805093327-bf97b73749ac"},
+		{name: "legacy prerelease witness", version: "0.62.0-rc.1", wantRefusal: true},
 	}
 
 	for _, tt := range tests {

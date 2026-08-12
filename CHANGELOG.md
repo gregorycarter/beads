@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **bd refused workspaces stamped by bd.** The cross-era upgrade guard read
+  `.beads/.local_version` by splitting on `.` and demanding exactly three
+  numeric parts, so any version string with a prerelease or build suffix failed
+  to parse — and an unparseable witness was reported as a legacy pre-1.0
+  workspace. bd then refused the workspace outright, for every command,
+  including the diagnostics that would explain why. This is not a hypothetical
+  input: `.goreleaser.yml` and `release.yml` stamp the release tag verbatim
+  into `main.Version` (this repository already carries `v1.1.0-rc.1` and
+  `v1.1.0-rc.2`), module-pinned builds stamp a Go pseudo-version such as
+  `v1.1.1-0.20260805093327-bf97b73749ac`, and `writeLocalVersion` records
+  whichever of those the binary holds. Reader and writer disagreed: bd could
+  not read back what bd had written. It took five production workspaces down,
+  each recovered only by hand-editing the marker.
+
+  The witness is now parsed with `golang.org/x/mod/semver`, so every string the
+  writer can emit round-trips, and the read bound rose from 64 to 256 bytes
+  because a decorated pseudo-version can legitimately exceed 64. The same
+  dot-counting bug also made the guard fail *open* on a decorated pre-1.0
+  witness (`0.62.0-rc.1` did not parse, so `legacyServerVersion` never matched);
+  that direction is fixed too.
+
+  **Failure policy changed.** A witness that is present but unparseable is now
+  *unknown*, not *legacy*: bd warns on stderr and proceeds. A parse failure is a
+  fact about the reader, not about the workspace, and answering an unanswerable
+  question with the most destructive available verdict is what turned a parsing
+  bug into a fleet outage. The confirmed verdicts stay fail-closed — a witness
+  that parses as pre-1.0 is still refused, a workspace with no witness at all is
+  still refused (`.local_version` has existed since 0.29.0, so its absence is
+  itself evidence of an older vintage), and the historical-SQLite and
+  removed-backend refusals are untouched.
+
 ## [1.2.1] - 2026-08-11
 
 (Released as 1.2.1: the v1.2.0 tag burned pre-publish on a freebsd
