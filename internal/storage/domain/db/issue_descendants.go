@@ -9,32 +9,6 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-type predBundle struct {
-	// matchesCTE is a named non-recursive CTE ("<name> AS (SELECT id FROM
-	// <table> WHERE ...)") that the walk branches reference via snippet.
-	// Hoisting the filter subquery out of the recursive branches is load-
-	// bearing: inlining `id IN (SELECT id FROM issues WHERE ...)` into three
-	// or more branches trips a dolt 2.1.6 analyzer bug ("unable to find
-	// field with index N in row of M columns") on the recursive LIKE-join
-	// branch. The named CTE keeps the semantics (same per-level filter) and
-	// dodges the analyzer.
-	matchesCTE string
-	snippet    string
-	args       []any
-}
-
-func buildDescendantsPred(table, alias, cteName string, clauses []string, args []any) predBundle {
-	if len(clauses) == 0 {
-		return predBundle{}
-	}
-	return predBundle{
-		matchesCTE: fmt.Sprintf("%s AS (SELECT id FROM %s WHERE %s)",
-			cteName, table, strings.Join(clauses, " AND ")),
-		snippet: fmt.Sprintf(" AND %s.id IN (SELECT id FROM %s)", alias, cteName),
-		args:    args,
-	}
-}
-
 func (r *issueSQLRepositoryImpl) GetDescendants(ctx context.Context, rootID string, filter types.IssueFilter) ([]*types.Issue, error) {
 	levelFilter := filter
 	levelFilter.ParentID = nil
@@ -68,21 +42,38 @@ func (r *issueSQLRepositoryImpl) GetDescendants(ctx context.Context, rootID stri
 		}
 	}
 
-	issuePred := buildDescendantsPred("issues", "i", "issue_matches", issueWhereClauses, issueArgs)
-	var wispPred predBundle
+	// The old implementation used a recursive UNION ALL CTE. It emitted one
+	// row for every route to a descendant, so diamonds multiplied work and an
+	// imported parent-child cycle recursed until Dolt's engine limit. Keep the
+	// traversal in the application, where a visited set makes the cost linear
+	// in the reachable graph. This is deliberately the same safety property as
+	// issueops.GetDescendantIDsInTx, while retaining this repository's dotted-ID
+	// fallback and per-level filter semantics.
+	issueMatches, err := r.matchingDescendantIDs(ctx, "issues", issueWhereClauses, issueArgs)
+	if err != nil {
+		return nil, fmt.Errorf("descendants: match issues: %w", err)
+	}
+	issueDotted, err := r.dottedDescendantIDs(ctx, "dependencies", issueMatches)
+	if err != nil {
+		return nil, fmt.Errorf("descendants: dotted issues: %w", err)
+	}
+
+	var wispMatches map[string]struct{}
+	var wispDotted map[string][]string
 	if walkWisps {
-		wispPred = buildDescendantsPred("wisps", "w", "wisp_matches", wispWhereClauses, wispArgs)
+		wispMatches, err = r.matchingDescendantIDs(ctx, "wisps", wispWhereClauses, wispArgs)
+		if err != nil {
+			return nil, fmt.Errorf("descendants: match wisps: %w", err)
+		}
+		wispDotted, err = r.dottedDescendantIDs(ctx, "wisp_dependencies", wispMatches)
+		if err != nil {
+			return nil, fmt.Errorf("descendants: dotted wisps: %w", err)
+		}
 	}
 
-	cte, allArgs := buildDescendantsCTE(rootID, walkWisps, issuePred, wispPred)
-
-	rows, err := r.runner.QueryContext(ctx, cte, allArgs...)
+	page, err := r.walkDescendants(ctx, rootID, issueMatches, issueDotted, wispMatches, wispDotted, walkWisps)
 	if err != nil {
-		return nil, fmt.Errorf("descendants: query: %w", err)
-	}
-	page, err := scanIDSrcPage(rows)
-	if err != nil {
-		return nil, fmt.Errorf("descendants: %w", err)
+		return nil, fmt.Errorf("descendants: walk: %w", err)
 	}
 
 	issuesByID, err := r.fetchIssuesByIDs(ctx, page.issueIDs, issuesFilterTables, filter)
@@ -101,101 +92,173 @@ func (r *issueSQLRepositoryImpl) GetDescendants(ctx context.Context, rootID stri
 	return reassembleBySrc(page.ordered, issuesByID, wispsByID), nil
 }
 
-// buildDescendantsCTE walks parent-child edges AND the dotted-ID fallback the
-// classic ParentID filter applies (issueops/filters.go): a row named
-// <node>.<suffix> with no parent-child edge at all is a child of <node>.
-// Rows carry a via marker: 'e' for edge-found, 'd' for dotted-found. Dotted
-// recursion only fires from 'e' rows — a dotted node's own dotted
-// descendants share its prefix and were already matched by whichever LIKE
-// found it, so re-expanding them would only multiply duplicate rows.
-// Filter predicates are hoisted into named matches CTEs (see predBundle) to
-// dodge a dolt 2.1.6 analyzer bug.
-func buildDescendantsCTE(rootID string, walkWisps bool, issuePred, wispPred predBundle) (string, []any) {
-	var b strings.Builder
-	var args []any
-	b.WriteString("WITH RECURSIVE ")
-	if issuePred.matchesCTE != "" {
-		b.WriteString(issuePred.matchesCTE)
-		b.WriteString(",\n")
-		args = append(args, issuePred.args...)
+type descendantRef struct {
+	id  string
+	src string
+	via byte // 'e' = parent-child edge, 'd' = dotted-ID fallback
+}
+
+func (r *issueSQLRepositoryImpl) matchingDescendantIDs(ctx context.Context, table string, clauses []string, args []any) (map[string]struct{}, error) {
+	where := ""
+	if len(clauses) > 0 {
+		where = " WHERE " + strings.Join(clauses, " AND ")
 	}
-	if walkWisps && wispPred.matchesCTE != "" {
-		b.WriteString(wispPred.matchesCTE)
-		b.WriteString(",\n")
-		args = append(args, wispPred.args...)
+	//nolint:gosec // G201: table is one of the two hardcoded issue tables.
+	rows, err := r.runner.QueryContext(ctx, fmt.Sprintf("SELECT id FROM %s%s", table, where), args...)
+	if err != nil {
+		return nil, err
 	}
-	b.WriteString("descendants AS (\n")
+	defer func() { _ = rows.Close() }()
 
-	fmt.Fprintf(&b, `    SELECT i.id, 'i' AS src, 'e' AS via
-    FROM issues i
-    JOIN dependencies d ON d.issue_id = i.id
-    WHERE d.type = 'parent-child'
-      AND COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id) = ?
-      %s`, issuePred.snippet)
-	args = append(args, rootID)
+	ids := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan matching id: %w", err)
+		}
+		ids[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
 
-	b.WriteString("\n    UNION ALL\n")
-	fmt.Fprintf(&b, `    SELECT i.id, 'i' AS src, 'd' AS via
-    FROM issues i
-    WHERE i.id LIKE CONCAT(?, '.%%')
-      AND i.id NOT IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child')
-      %s`, issuePred.snippet)
-	args = append(args, rootID)
-
-	if walkWisps {
-		b.WriteString("\n    UNION ALL\n")
-		fmt.Fprintf(&b, `    SELECT w.id, 'w' AS src, 'e' AS via
-    FROM wisps w
-    JOIN wisp_dependencies wd ON wd.issue_id = w.id
-    WHERE wd.type = 'parent-child'
-      AND COALESCE(wd.depends_on_issue_id, wd.depends_on_wisp_id) = ?
-      %s`, wispPred.snippet)
-		args = append(args, rootID)
-
-		b.WriteString("\n    UNION ALL\n")
-		fmt.Fprintf(&b, `    SELECT w.id, 'w' AS src, 'd' AS via
-    FROM wisps w
-    WHERE w.id LIKE CONCAT(?, '.%%')
-      AND w.id NOT IN (SELECT issue_id FROM wisp_dependencies WHERE type = 'parent-child')
-      %s`, wispPred.snippet)
-		args = append(args, rootID)
+// dottedDescendantIDs builds the dotted-ID fallback index once per call. A
+// dotted row without a parent-child edge is a descendant of every dotted
+// prefix, matching the old `id LIKE CONCAT(parent, '.%')` behavior without a
+// recursive LIKE join.
+func (r *issueSQLRepositoryImpl) dottedDescendantIDs(ctx context.Context, depTable string, matches map[string]struct{}) (map[string][]string, error) {
+	//nolint:gosec // G201: depTable is one of the two hardcoded dependency tables.
+	rows, err := r.runner.QueryContext(ctx, fmt.Sprintf("SELECT issue_id FROM %s WHERE type = 'parent-child'", depTable))
+	if err != nil {
+		return nil, err
+	}
+	explicit := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan explicit child: %w", err)
+		}
+		explicit[id] = struct{}{}
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
-	b.WriteString("\n    UNION ALL\n")
+	byParent := make(map[string][]string)
+	for id := range matches {
+		if _, hasExplicitParent := explicit[id]; hasExplicitParent {
+			continue
+		}
+		for parent := dottedParentID(id); parent != ""; parent = dottedParentID(parent) {
+			byParent[parent] = append(byParent[parent], id)
+		}
+	}
+	return byParent, nil
+}
 
-	fmt.Fprintf(&b, `    SELECT i.id, 'i' AS src, 'e' AS via
-    FROM issues i
-    JOIN dependencies d ON d.issue_id = i.id
-    JOIN descendants p ON COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id) = p.id
-    WHERE d.type = 'parent-child'
-      %s`, issuePred.snippet)
+func dottedParentID(id string) string {
+	if at := strings.LastIndexByte(id, '.'); at >= 0 {
+		return id[:at]
+	}
+	return ""
+}
 
-	b.WriteString("\n    UNION ALL\n")
-	fmt.Fprintf(&b, `    SELECT i.id, 'i' AS src, 'd' AS via
-    FROM issues i
-    JOIN descendants p ON i.id LIKE CONCAT(p.id, '.%%')
-    WHERE p.via = 'e'
-      AND i.id NOT IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child')
-      %s`, issuePred.snippet)
+func (r *issueSQLRepositoryImpl) walkDescendants(ctx context.Context, rootID string, issueMatches map[string]struct{}, issueDotted map[string][]string, wispMatches map[string]struct{}, wispDotted map[string][]string, walkWisps bool) (idSrcPage, error) {
+	seen := map[string]struct{}{rootID: {}}
+	frontier := []descendantRef{{id: rootID, via: 'e'}}
+	var page idSrcPage
 
-	if walkWisps {
-		b.WriteString("\n    UNION ALL\n")
-		fmt.Fprintf(&b, `    SELECT w.id, 'w' AS src, 'e' AS via
-    FROM wisps w
-    JOIN wisp_dependencies wd ON wd.issue_id = w.id
-    JOIN descendants p ON COALESCE(wd.depends_on_issue_id, wd.depends_on_wisp_id) = p.id
-    WHERE wd.type = 'parent-child'
-      %s`, wispPred.snippet)
-
-		b.WriteString("\n    UNION ALL\n")
-		fmt.Fprintf(&b, `    SELECT w.id, 'w' AS src, 'd' AS via
-    FROM wisps w
-    JOIN descendants p ON w.id LIKE CONCAT(p.id, '.%%')
-    WHERE p.via = 'e'
-      AND w.id NOT IN (SELECT issue_id FROM wisp_dependencies WHERE type = 'parent-child')
-      %s`, wispPred.snippet)
+	appendRef := func(ref descendantRef, matches map[string]struct{}, next *[]descendantRef) {
+		if _, allowed := matches[ref.id]; !allowed {
+			return // A filtered node is not returned and cannot extend the walk.
+		}
+		if _, duplicate := seen[ref.id]; duplicate {
+			return
+		}
+		seen[ref.id] = struct{}{}
+		page.ordered = append(page.ordered, idSrcRef{id: ref.id, src: ref.src})
+		switch ref.src {
+		case "i":
+			page.issueIDs = append(page.issueIDs, ref.id)
+		case "w":
+			page.wispIDs = append(page.wispIDs, ref.id)
+		}
+		*next = append(*next, ref)
 	}
 
-	b.WriteString("\n)\nSELECT id, src FROM descendants\n")
-	return b.String(), args
+	for len(frontier) > 0 {
+		parentIDs := make([]string, len(frontier))
+		for i, parent := range frontier {
+			parentIDs[i] = parent.id
+		}
+		var next []descendantRef
+
+		issueEdges, err := r.parentChildDescendantIDs(ctx, "dependencies", parentIDs)
+		if err != nil {
+			return idSrcPage{}, fmt.Errorf("issue edge children: %w", err)
+		}
+		for _, id := range issueEdges {
+			appendRef(descendantRef{id: id, src: "i", via: 'e'}, issueMatches, &next)
+		}
+		for _, parent := range frontier {
+			if parent.via != 'e' {
+				continue
+			}
+			for _, id := range issueDotted[parent.id] {
+				appendRef(descendantRef{id: id, src: "i", via: 'd'}, issueMatches, &next)
+			}
+		}
+
+		if walkWisps {
+			wispEdges, err := r.parentChildDescendantIDs(ctx, "wisp_dependencies", parentIDs)
+			if err != nil {
+				return idSrcPage{}, fmt.Errorf("wisp edge children: %w", err)
+			}
+			for _, id := range wispEdges {
+				appendRef(descendantRef{id: id, src: "w", via: 'e'}, wispMatches, &next)
+			}
+			for _, parent := range frontier {
+				if parent.via != 'e' {
+					continue
+				}
+				for _, id := range wispDotted[parent.id] {
+					appendRef(descendantRef{id: id, src: "w", via: 'd'}, wispMatches, &next)
+				}
+			}
+		}
+		frontier = next
+	}
+	return page, nil
+}
+
+func (r *issueSQLRepositoryImpl) parentChildDescendantIDs(ctx context.Context, depTable string, parentIDs []string) ([]string, error) {
+	var out []string
+	for start := 0; start < len(parentIDs); start += queryBatchSize {
+		end := min(start+queryBatchSize, len(parentIDs))
+		placeholders, args := buildInPlaceholders(parentIDs[start:end])
+		//nolint:gosec // G201: depTable is one of the two hardcoded dependency tables.
+		rows, err := r.runner.QueryContext(ctx, fmt.Sprintf(`
+			SELECT issue_id FROM %s
+			WHERE type = 'parent-child' AND %s IN (%s)`, depTable, depTargetExpr, placeholders), args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan child: %w", err)
+			}
+			out = append(out, id)
+		}
+		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
