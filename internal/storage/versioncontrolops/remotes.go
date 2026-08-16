@@ -63,14 +63,19 @@ func Fetch(ctx context.Context, db DBConn, peer, user string) error {
 // If user is non-empty, authenticates with that user — DOLT_REMOTE_PASSWORD
 // must be set in the in-process Dolt server's environment. Required when
 // pushing to a remotesapi server that enforces CLONE_ADMIN authentication.
+// Push is bounded by a deadline, refuses to stack a second push for the same
+// remote/branch, and opens a circuit breaker after repeated failures — see
+// pushguard.go for why (be-glm).
 func Push(ctx context.Context, db DBConn, remote, branch, user string) error {
-	err := withRemoteEnvGuards(func() error {
-		if user != "" {
-			_, err := db.ExecContext(ctx, "CALL DOLT_PUSH('--user', ?, ?, ?)", user, remote, branch)
+	err := guardedPush(ctx, remote, branch, func(ctx context.Context) error {
+		return withRemoteEnvGuards(func() error {
+			if user != "" {
+				_, err := db.ExecContext(ctx, "CALL DOLT_PUSH('--user', ?, ?, ?)", user, remote, branch)
+				return err
+			}
+			_, err := db.ExecContext(ctx, "CALL DOLT_PUSH(?, ?)", remote, branch)
 			return err
-		}
-		_, err := db.ExecContext(ctx, "CALL DOLT_PUSH(?, ?)", remote, branch)
-		return err
+		})
 	})
 	if err != nil {
 		return fmt.Errorf("push to %s/%s: %w", remote, branch, err)
@@ -80,14 +85,17 @@ func Push(ctx context.Context, db DBConn, remote, branch, user string) error {
 
 // ForcePush force-pushes the given branch to the named remote.
 // See Push for the user/auth contract.
+// ForcePush carries the same guards as Push (be-glm).
 func ForcePush(ctx context.Context, db DBConn, remote, branch, user string) error {
-	err := withRemoteEnvGuards(func() error {
-		if user != "" {
-			_, err := db.ExecContext(ctx, "CALL DOLT_PUSH('--force', '--user', ?, ?, ?)", user, remote, branch)
+	err := guardedPush(ctx, remote, branch, func(ctx context.Context) error {
+		return withRemoteEnvGuards(func() error {
+			if user != "" {
+				_, err := db.ExecContext(ctx, "CALL DOLT_PUSH('--force', '--user', ?, ?, ?)", user, remote, branch)
+				return err
+			}
+			_, err := db.ExecContext(ctx, "CALL DOLT_PUSH('--force', ?, ?)", remote, branch)
 			return err
-		}
-		_, err := db.ExecContext(ctx, "CALL DOLT_PUSH('--force', ?, ?)", remote, branch)
-		return err
+		})
 	})
 	if err != nil {
 		return fmt.Errorf("force push to %s/%s: %w", remote, branch, err)
