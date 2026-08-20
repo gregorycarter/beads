@@ -468,10 +468,11 @@ type Config struct {
 	ConnMaxLifetime time.Duration
 
 	// ConnMaxIdleTime overrides how long a connection may sit idle in the pool
-	// before the pool retires it (0 = default 20s). This must stay below the
-	// dolt sql-server wait_timeout (currently 30s) so the pool retires an idle
-	// connection before the server reaps it server-side; otherwise the next
-	// query handed a server-reaped connection fails with "invalid connection".
+	// before the pool retires it (0 = default 10s). This must stay below both the
+	// managed dolt sql-server listener read timeout (currently 15s) and its
+	// wait_timeout (currently 30s) so the pool retires an idle connection before
+	// the server reaps it server-side; otherwise the next query handed a
+	// server-reaped connection fails with "invalid connection".
 	ConnMaxIdleTime time.Duration
 
 	// PoolReadTimeout / PoolWriteTimeout override the per-I/O read/write
@@ -494,10 +495,12 @@ const (
 	defaultMaxIdleConns    = 5
 	defaultConnMaxLifetime = time.Hour
 	// defaultConnMaxIdleTime keeps idle pooled connections shorter-lived than the
-	// dolt sql-server wait_timeout (30s) so the pool retires an idle connection
-	// before the server reaps it; this prevents the next read from picking up a
-	// server-closed connection and failing with "invalid connection".
-	defaultConnMaxIdleTime = 20 * time.Second
+	// managed dolt sql-server listener read timeout (15s), as well as its longer
+	// wait_timeout (30s). The previous 20s default exceeded the listener timeout,
+	// guaranteeing a five-second window in which the pool could hand out a
+	// server-reaped connection and forcing callers through invalid-connection
+	// retries.
+	defaultConnMaxIdleTime = 10 * time.Second
 	// defaultPoolReadTimeout / defaultPoolWriteTimeout are the per-I/O
 	// deadlines on shared-pool connections. Overridable via
 	// Config.PoolReadTimeout/PoolWriteTimeout (BEADS_DOLT_POOL_READ_TIMEOUT /

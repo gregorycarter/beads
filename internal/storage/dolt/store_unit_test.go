@@ -604,6 +604,20 @@ func TestBuildServerDSN_PoolTimeouts(t *testing.T) {
 	}
 }
 
+// TestDefaultConnMaxIdleTimeStaysBelowManagedListenerTimeout protects the
+// client/server ordering required by managed Gas City deployments. The managed
+// Dolt listener reaps idle sockets after 15s, so the shared pool must retire
+// them first instead of briefly retaining server-closed connections.
+func TestDefaultConnMaxIdleTimeStaysBelowManagedListenerTimeout(t *testing.T) {
+	const managedListenerReadTimeout = 15 * time.Second
+	if defaultConnMaxIdleTime != 10*time.Second {
+		t.Fatalf("defaultConnMaxIdleTime = %v, want 10s", defaultConnMaxIdleTime)
+	}
+	if defaultConnMaxIdleTime >= managedListenerReadTimeout {
+		t.Fatalf("defaultConnMaxIdleTime = %v, must be below managed listener timeout %v", defaultConnMaxIdleTime, managedListenerReadTimeout)
+	}
+}
+
 // TestParseTimeout verifies the shared duration-setting parser: ParseDuration
 // strings, bare seconds, and fallback on empty/invalid/non-positive input.
 func TestParseTimeout(t *testing.T) {
